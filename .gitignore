@@ -24,6 +24,12 @@ frontend/node_modules/
 dist/
 frontend/dist/
 
+# CI reports and scanner working files
+reports/
+grype-*-report.txt
+grype-*-report.json
+.scannerwork/
+
 # Logs and temporary files
 *.log
 *.tmp

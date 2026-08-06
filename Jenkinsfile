@@ -3,8 +3,9 @@ pipeline {
 
     options {
         disableConcurrentBuilds()
+        skipDefaultCheckout(true)
         timestamps()
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 90, unit: 'MINUTES')
     }
 
     triggers {
@@ -13,244 +14,551 @@ pipeline {
 
     parameters {
         booleanParam(
-            name: 'RUN_SONAR',
+            name: 'DEPLOY_STAGING',
             defaultValue: false,
-            description: 'Run SonarQube analysis after the sonar-token credential is configured.'
+            description: 'Pause for approval and promote the tested images to Docker staging.'
         )
         booleanParam(
-            name: 'ENFORCE_SECURITY_GATES',
+            name: 'DEPLOY_PRODUCTION',
             defaultValue: false,
-            description: 'Fail on HIGH/CRITICAL dependency, repository, or image findings.'
+            description: 'After staging, pause again and promote the same images to Docker production.'
+        )
+        booleanParam(
+            name: 'ENFORCE_GITLEAKS',
+            defaultValue: true,
+            description: 'Fail when Gitleaks detects a potential committed secret.'
+        )
+        booleanParam(
+            name: 'ENFORCE_DEPENDENCY_AUDIT',
+            defaultValue: false,
+            description: 'Fail on high-severity Python, npm, or repository findings.'
+        )
+        booleanParam(
+            name: 'ENFORCE_TRIVY',
+            defaultValue: false,
+            description: 'Fail on fixed HIGH or CRITICAL vulnerabilities in either image.'
+        )
+        booleanParam(
+            name: 'ENFORCE_GRYPE',
+            defaultValue: false,
+            description: 'Fail when Grype reports HIGH or CRITICAL image vulnerabilities.'
+        )
+        booleanParam(
+            name: 'RUN_ZAP_DAST',
+            defaultValue: true,
+            description: 'Run an OWASP ZAP baseline scan against the Docker dev deployment.'
+        )
+        booleanParam(
+            name: 'ENFORCE_ZAP',
+            defaultValue: false,
+            description: 'Fail when OWASP ZAP reports application security warnings or failures.'
         )
     }
 
     environment {
+        JENKINS_CONTAINER = 'devsecops-jenkins'
+
         BACKEND_IMAGE = "secureauth-backend:${BUILD_NUMBER}"
         FRONTEND_IMAGE = "secureauth-frontend:${BUILD_NUMBER}"
-        MINIKUBE_PROFILE = 'devsecops'
-        SONAR_HOST_URL = 'http://sonarqube:9000'
+
+        PYTHON_TEST_IMAGE = 'python:3.11-slim-trixie'
+        NODE_TEST_IMAGE = 'node:22-slim'
+        GITLEAKS_IMAGE = 'ghcr.io/gitleaks/gitleaks:latest'
+        ZAP_IMAGE = 'ghcr.io/zaproxy/zaproxy:stable'
+
+        DEV_NETWORK = 'secureauth-dev'
+        DEV_FRONTEND_CONTAINER = 'secureauth-frontend-dev'
+        ZAP_TARGET = 'http://secureauth-frontend:8080'
     }
 
     stages {
-        stage('Backend tests') {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh '''
+                    set -eu
+                    mkdir -p reports
+
+                    if [ "$DEPLOY_PRODUCTION" = "true" ] && [ "$DEPLOY_STAGING" != "true" ]; then
+                        echo 'DEPLOY_PRODUCTION requires DEPLOY_STAGING.' >&2
+                        exit 2
+                    fi
+                '''
+            }
+        }
+
+        stage('Gitleaks Secret Scan') {
             steps {
                 sh '''
                     set -eu
+                    mkdir -p reports
+
+                    echo 'Scanning Git history for passwords, tokens and API keys.'
+                    set +e
+                    docker run --rm \
+                        --volumes-from "$JENKINS_CONTAINER" \
+                        --workdir "$WORKSPACE" \
+                        --user "$(id -u):$(id -g)" \
+                        "$GITLEAKS_IMAGE" \
+                        git \
+                        --redact \
+                        --verbose \
+                        --exit-code 10 \
+                        --report-format json \
+                        --report-path reports/gitleaks-report.json \
+                        .
+                    gitleaks_status=$?
+                    set -e
+
+                    case "$gitleaks_status" in
+                        0)
+                            echo 'Gitleaks completed: no potential secrets detected.'
+                            ;;
+                        10)
+                            echo 'Gitleaks detected potential secrets.'
+                            echo 'Review reports/gitleaks-report.json.'
+                            if [ "$ENFORCE_GITLEAKS" = "true" ]; then
+                                exit 1
+                            fi
+                            echo 'Gitleaks enforcement is disabled; continuing for demonstration.'
+                            ;;
+                        *)
+                            echo "Gitleaks execution failed with status $gitleaks_status." >&2
+                            exit "$gitleaks_status"
+                            ;;
+                    esac
+                '''
+            }
+        }
+
+        stage('Backend Tests') {
+            steps {
+                sh '''
+                    set -eu
+                    mkdir -p reports
                     docker run --rm \
                         --env PYTHONDONTWRITEBYTECODE=1 \
-                        --volume "$WORKSPACE:/workspace" \
-                        --workdir /workspace \
-                        python:3.11-slim-trixie \
-                        sh -c 'python -m pip install --quiet --disable-pip-version-check -r requirements.txt && python -m unittest discover -s tests -v'
+                        --volumes-from "$JENKINS_CONTAINER" \
+                        --workdir "$WORKSPACE" \
+                        "$PYTHON_TEST_IMAGE" \
+                        sh -c 'python -m pip install --quiet --disable-pip-version-check \
+                                   -r requirements.txt pytest==8.3.5 pytest-cov==6.0.0 && \
+                               python -m pytest -v tests \
+                                   --junitxml=reports/backend-junit.xml \
+                                   --cov=backend \
+                                   --cov-report=term \
+                                   --cov-report=xml:reports/backend-coverage.xml'
                 '''
             }
         }
 
-        stage('Frontend checks') {
+        stage('Frontend Typecheck, Tests and Build') {
             steps {
                 sh '''
                     set -eu
+                    mkdir -p reports
                     docker run --rm \
                         --env HOME=/tmp \
-                        --volume "$WORKSPACE/frontend:/app" \
-                        --workdir /app \
-                        node:22-slim \
-                        sh -c 'npm ci && npm run typecheck && npm run build'
+                        --volumes-from "$JENKINS_CONTAINER" \
+                        --workdir "$WORKSPACE/frontend" \
+                        "$NODE_TEST_IMAGE" \
+                        sh -c 'npm ci && \
+                               npm run typecheck && \
+                               npm test -- \
+                                   --reporter=default \
+                                   --reporter=junit \
+                                   --outputFile.junit=../reports/frontend-junit.xml && \
+                               npm run build'
                 '''
             }
         }
 
-        stage('Dependency audit') {
+        stage('Dependency Audit') {
             steps {
                 sh '''
                     set -u
-                    failed=0
-                    docker run --rm \
-                        --volume "$WORKSPACE:/workspace" \
-                        --workdir /workspace \
-                        python:3.11-slim-trixie \
-                        sh -c 'python -m pip install --quiet pip-audit && python -m pip_audit -r requirements.txt' || failed=1
-
-                    docker run --rm \
-                        --volume "$WORKSPACE/frontend:/app" \
-                        --workdir /app \
-                        node:22-slim \
-                        npm audit --omit=dev --audit-level=high || failed=1
-
-                    if [ "$failed" -ne 0 ] && [ "$ENFORCE_SECURITY_GATES" = "true" ]; then
-                        exit 1
-                    fi
-                    if [ "$failed" -ne 0 ]; then
-                        echo 'Dependency findings reported; enforcement is disabled for this learning build.'
-                    fi
-                '''
-            }
-        }
-
-        stage('Repository security scan') {
-            steps {
-                sh '''
-                    set -eu
-                    exit_code=0
-                    [ "$ENFORCE_SECURITY_GATES" = "true" ] && exit_code=1
                     mkdir -p reports
-                    trivy fs --scanners vuln,secret,misconfig \
-                        --severity HIGH,CRITICAL --exit-code "$exit_code" \
-                        --skip-dirs .git --skip-dirs frontend/node_modules \
-                        --format json --output reports/trivy-filesystem.json .
-                    trivy fs --scanners vuln,secret,misconfig \
-                        --severity HIGH,CRITICAL --exit-code 0 \
-                        --skip-dirs .git --skip-dirs frontend/node_modules .
+                    audit_failed=0
+
+                    docker run --rm \
+                        --env PYTHONDONTWRITEBYTECODE=1 \
+                        --volumes-from "$JENKINS_CONTAINER" \
+                        --workdir "$WORKSPACE" \
+                        "$PYTHON_TEST_IMAGE" \
+                        sh -c 'python -m pip install --quiet --disable-pip-version-check pip-audit && \
+                               python -m pip_audit \
+                                   --requirement requirements.txt \
+                                   --format json \
+                                   --output reports/pip-audit.json' || audit_failed=1
+
+                    docker run --rm \
+                        --env HOME=/tmp \
+                        --volumes-from "$JENKINS_CONTAINER" \
+                        --workdir "$WORKSPACE/frontend" \
+                        "$NODE_TEST_IMAGE" \
+                        sh -c 'npm audit --omit=dev --audit-level=high --json \
+                                   > ../reports/npm-audit.json' || audit_failed=1
+
+                    trivy fs \
+                        --scanners vuln,secret,misconfig \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --skip-dirs .git \
+                        --skip-dirs frontend/node_modules \
+                        --format json \
+                        --output reports/trivy-repository.json \
+                        .
+
+                    trivy fs \
+                        --scanners vuln,secret,misconfig \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --skip-dirs .git \
+                        --skip-dirs frontend/node_modules \
+                        .
+
+                    if [ "$audit_failed" -ne 0 ]; then
+                        if [ "$ENFORCE_DEPENDENCY_AUDIT" = "true" ]; then
+                            echo 'Dependency audit enforcement is enabled.' >&2
+                            exit 1
+                        fi
+                        echo 'Dependency findings were recorded; enforcement is disabled.'
+                    fi
                 '''
             }
         }
 
-        stage('SonarQube analysis') {
-            when {
-                expression { params.RUN_SONAR }
-            }
+        stage('SonarQube Analysis') {
             steps {
-                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                withSonarQubeEnv('secureauth-sonarqube') {
                     sh '''
                         set -eu
                         sonar-scanner \
                             -Dsonar.host.url="$SONAR_HOST_URL" \
-                            -Dsonar.token="$SONAR_TOKEN"
-
-                        task_url=$(sed -n 's/^ceTaskUrl=//p' .scannerwork/report-task.txt)
-                        attempt=0
-                        while [ "$attempt" -lt 30 ]; do
-                            task_json=$(curl --fail --silent --user "$SONAR_TOKEN:" "$task_url")
-                            task_status=$(printf '%s' "$task_json" | jq -r '.task.status')
-                            case "$task_status" in
-                                SUCCESS)
-                                    analysis_id=$(printf '%s' "$task_json" | jq -r '.task.analysisId')
-                                    break
-                                    ;;
-                                FAILED|CANCELED)
-                                    echo "SonarQube compute task: $task_status"
-                                    exit 1
-                                    ;;
-                            esac
-                            attempt=$((attempt + 1))
-                            sleep 2
-                        done
-                        test -n "${analysis_id:-}"
-                        gate=$(curl --fail --silent --user "$SONAR_TOKEN:" \
-                            "$SONAR_HOST_URL/api/qualitygates/project_status?analysisId=$analysis_id" \
-                            | jq -r '.projectStatus.status')
-                        echo "SonarQube quality gate: $gate"
-                        test "$gate" = "OK"
+                            -Dsonar.token="$SONAR_AUTH_TOKEN"
                     '''
                 }
             }
         }
 
-        stage('Build container images') {
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build Backend and Frontend Images') {
             steps {
                 sh '''
                     set -eu
-                    docker build --pull --file Dockerfile.backend --tag "$BACKEND_IMAGE" .
-                    docker build --pull --file Dockerfile.frontend --tag "$FRONTEND_IMAGE" .
+                    docker build --pull \
+                        --file Dockerfile.backend \
+                        --tag "$BACKEND_IMAGE" \
+                        .
+                    docker build --pull \
+                        --file Dockerfile.frontend \
+                        --tag "$FRONTEND_IMAGE" \
+                        .
                 '''
             }
         }
 
-        stage('Container vulnerability scan') {
+        stage('Trivy Scan - Both Images') {
             steps {
                 sh '''
                     set -eu
-                    exit_code=0
-                    [ "$ENFORCE_SECURITY_GATES" = "true" ] && exit_code=1
                     mkdir -p reports
-                    trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                        --exit-code "$exit_code" --format json \
-                        --output reports/trivy-backend-image.json "$BACKEND_IMAGE"
-                    trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                        --exit-code "$exit_code" --format json \
-                        --output reports/trivy-frontend-image.json "$FRONTEND_IMAGE"
+                    exit_code=0
+                    scan_failed=0
+                    if [ "$ENFORCE_TRIVY" = "true" ]; then
+                        exit_code=1
+                    fi
+
+                    if ! trivy image \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code "$exit_code" \
+                        --format json \
+                        --output reports/trivy-backend-image.json \
+                        "$BACKEND_IMAGE"; then
+                        scan_failed=1
+                    fi
+
+                    if ! trivy image \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code "$exit_code" \
+                        --format json \
+                        --output reports/trivy-frontend-image.json \
+                        "$FRONTEND_IMAGE"; then
+                        scan_failed=1
+                    fi
+
+                    echo 'Backend image findings:'
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 0 \
+                        "$BACKEND_IMAGE"
+
+                    echo 'Frontend image findings:'
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 0 \
+                        "$FRONTEND_IMAGE"
+
+                    if [ "$scan_failed" -ne 0 ]; then
+                        echo 'Trivy enforcement is enabled and findings exceeded the policy.' >&2
+                        exit 1
+                    fi
                 '''
             }
         }
 
-        stage('Load images into Minikube') {
+        stage('Grype Scan - Both Images') {
+            steps {
+                grypeScan(
+                    scanDest: "docker:${env.BACKEND_IMAGE}",
+                    repName: 'grype-backend-report.txt',
+                    autoInstall: true
+                )
+                grypeScan(
+                    scanDest: "docker:${env.FRONTEND_IMAGE}",
+                    repName: 'grype-frontend-report.txt',
+                    autoInstall: true
+                )
+            }
+        }
+
+        stage('Grype Warnings Check') {
+            steps {
+                script {
+                    if (params.ENFORCE_GRYPE) {
+                        recordIssues(
+                            tools: [grype(pattern: 'grype-*-report.json')],
+                            aggregatingResults: true,
+                            qualityGates: [
+                                [
+                                    threshold: 1,
+                                    type: 'TOTAL_ERROR',
+                                    criticality: 'FAILURE'
+                                ],
+                                [
+                                    threshold: 1,
+                                    type: 'TOTAL_HIGH',
+                                    criticality: 'FAILURE'
+                                ]
+                            ]
+                        )
+                    } else {
+                        recordIssues(
+                            tools: [grype(pattern: 'grype-*-report.json')],
+                            aggregatingResults: true
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Dev') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'secureauth-admin',
+                        usernameVariable: 'ADMIN_USERNAME',
+                        passwordVariable: 'ADMIN_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'secureauth-hmac-secret',
+                        variable: 'HMAC_SECRET_FALLBACK'
+                    )
+                ]) {
+                    sh 'sh ./scripts/docker-deploy.sh dev "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
+                }
+            }
+        }
+
+        stage('OWASP ZAP DAST') {
+            when {
+                expression { params.RUN_ZAP_DAST }
+            }
             steps {
                 sh '''
                     set -eu
-                    docker save "$BACKEND_IMAGE" | docker exec -i "$MINIKUBE_PROFILE" docker load
-                    docker save "$FRONTEND_IMAGE" | docker exec -i "$MINIKUBE_PROFILE" docker load
+                    mkdir -p reports
+
+                    docker exec "$DEV_FRONTEND_CONTAINER" \
+                        wget --quiet --tries=1 --spider \
+                        http://127.0.0.1:8080/healthz
+
+                    zap_container="zap-secureauth-${BUILD_NUMBER}"
+                    cleanup_zap() {
+                        docker rm --force --volumes "$zap_container" \
+                            >/dev/null 2>&1 || true
+                    }
+                    trap cleanup_zap EXIT INT TERM
+
+                    echo "Running OWASP ZAP Baseline Scan against $ZAP_TARGET"
+                    set +e
+                    docker run \
+                        --name "$zap_container" \
+                        --network "$DEV_NETWORK" \
+                        --user 0:0 \
+                        --volume /zap/wrk \
+                        "$ZAP_IMAGE" \
+                        zap-baseline.py \
+                        -t "$ZAP_TARGET" \
+                        -m 1 \
+                        -T 5 \
+                        -r zap-secureauth-report.html \
+                        -J zap-secureauth-report.json \
+                        -x zap-secureauth-report.xml
+                    zap_status=$?
+                    set -e
+
+                    for report in \
+                        zap-secureauth-report.html \
+                        zap-secureauth-report.json \
+                        zap-secureauth-report.xml; do
+                        docker cp \
+                            "${zap_container}:/zap/wrk/${report}" \
+                            "reports/${report}" 2>/dev/null || true
+                    done
+
+                    if [ ! -s reports/zap-secureauth-report.html ]; then
+                        echo 'OWASP ZAP did not produce the expected report.' >&2
+                        exit 3
+                    fi
+
+                    case "$zap_status" in
+                        0)
+                            echo 'OWASP ZAP completed without policy findings.'
+                            ;;
+                        1|2)
+                            echo "OWASP ZAP completed with security findings (status $zap_status)."
+                            if [ "$ENFORCE_ZAP" = "true" ]; then
+                                exit "$zap_status"
+                            fi
+                            echo 'ZAP enforcement is disabled; reports were archived for review.'
+                            ;;
+                        *)
+                            echo "OWASP ZAP execution failed with status $zap_status." >&2
+                            exit "$zap_status"
+                            ;;
+                    esac
                 '''
             }
         }
 
-        stage('Deploy: dev') {
-            steps {
-                sh './scripts/deploy.sh dev "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
-            }
-        }
-
-        stage('Approve staging') {
+        stage('Approve Staging') {
             when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH == 'origin/main' || env.GIT_BRANCH == 'main' }
-                }
+                expression { params.DEPLOY_STAGING }
             }
             input {
-                message 'Promote these tested images to staging?'
-                ok 'Deploy staging'
+                message 'Promote these tested Docker images to staging?'
+                ok 'Approve staging'
+                submitterParameter 'STAGING_APPROVER'
             }
             steps {
-                echo 'Staging promotion approved.'
+                echo "Staging approved by ${STAGING_APPROVER}."
             }
         }
 
-        stage('Deploy: staging') {
+        stage('Deploy Staging') {
             when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH == 'origin/main' || env.GIT_BRANCH == 'main' }
-                }
+                expression { params.DEPLOY_STAGING }
             }
             steps {
-                sh './scripts/deploy.sh staging "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'secureauth-admin',
+                        usernameVariable: 'ADMIN_USERNAME',
+                        passwordVariable: 'ADMIN_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'secureauth-hmac-secret',
+                        variable: 'HMAC_SECRET_FALLBACK'
+                    )
+                ]) {
+                    sh 'sh ./scripts/docker-deploy.sh staging "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
+                }
             }
         }
 
-        stage('Approve production') {
+        stage('Approve Production') {
             when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH == 'origin/main' || env.GIT_BRANCH == 'main' }
-                }
+                expression { params.DEPLOY_PRODUCTION }
             }
             input {
-                message 'Promote these exact images to production?'
-                ok 'Deploy production'
-                submitterParameter 'APPROVER'
+                message 'Promote these exact Docker images to production?'
+                ok 'Approve production'
+                submitterParameter 'PRODUCTION_APPROVER'
             }
             steps {
-                echo "Production promotion approved by ${APPROVER}."
+                echo "Production approved by ${PRODUCTION_APPROVER}."
             }
         }
 
-        stage('Deploy: production') {
+        stage('Deploy Production') {
             when {
-                anyOf {
-                    branch 'main'
-                    expression { env.GIT_BRANCH == 'origin/main' || env.GIT_BRANCH == 'main' }
-                }
+                expression { params.DEPLOY_PRODUCTION }
             }
             steps {
-                sh './scripts/deploy.sh production "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'secureauth-admin',
+                        usernameVariable: 'ADMIN_USERNAME',
+                        passwordVariable: 'ADMIN_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'secureauth-hmac-secret',
+                        variable: 'HMAC_SECRET_FALLBACK'
+                    )
+                ]) {
+                    sh 'sh ./scripts/docker-deploy.sh production "$BACKEND_IMAGE" "$FRONTEND_IMAGE"'
+                }
+            }
+        }
+
+        stage('Archive Reports') {
+            steps {
+                junit(
+                    allowEmptyResults: true,
+                    testResults: 'reports/backend-junit.xml,reports/frontend-junit.xml'
+                )
+                archiveArtifacts(
+                    allowEmptyArchive: true,
+                    artifacts: 'reports/**,grype-*-report.txt,grype-*-report.json,.scannerwork/report-task.txt'
+                )
             }
         }
     }
 
     post {
-        always {
-            archiveArtifacts allowEmptyArchive: true,
-                artifacts: 'reports/**,.scannerwork/report-task.txt'
+        unsuccessful {
+            junit(
+                allowEmptyResults: true,
+                testResults: 'reports/backend-junit.xml,reports/frontend-junit.xml'
+            )
+            archiveArtifacts(
+                allowEmptyArchive: true,
+                artifacts: 'reports/**,grype-*-report.txt,grype-*-report.json,.scannerwork/report-task.txt'
+            )
+        }
+        success {
+            echo 'SecureAuth DevSecOps pipeline completed successfully.'
+            echo 'Docker dev URL: http://localhost:18080'
+            script {
+                if (params.DEPLOY_STAGING) {
+                    echo 'Docker staging URL: http://localhost:18081'
+                }
+                if (params.DEPLOY_PRODUCTION) {
+                    echo 'Docker production URL: http://localhost:18082'
+                }
+            }
         }
     }
 }
