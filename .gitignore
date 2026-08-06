@@ -1,0 +1,33 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Local database/runtime state
+backend/database/auth_system.db
+*.sqlite
+*.sqlite3
+
+# Frontend dependencies/build output
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Archives
+*.zip

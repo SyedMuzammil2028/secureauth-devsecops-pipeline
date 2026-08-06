@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secureauth-backend
+  labels:
+    app.kubernetes.io/name: secureauth
+    app.kubernetes.io/component: backend
+spec:
+  selector:
+    app.kubernetes.io/name: secureauth
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+

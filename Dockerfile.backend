@@ -1,0 +1,35 @@
+FROM python:3.11-slim-trixie
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DB_PATH=/data/auth_system.db \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000
+
+WORKDIR /app
+
+ARG PIP_VERSION=26.1.2
+ARG SETUPTOOLS_VERSION=83.0.0
+
+RUN groupadd --system --gid 10001 secureauth \
+    && useradd --system --uid 10001 --gid secureauth --home-dir /app secureauth \
+    && mkdir -p /data \
+    && chown secureauth:secureauth /data
+
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir --disable-pip-version-check --upgrade \
+        "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" \
+    && python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+
+COPY --chown=secureauth:secureauth backend ./backend
+COPY --chown=secureauth:secureauth scripts/backend-entrypoint.sh /usr/local/bin/backend-entrypoint
+RUN chmod 0555 /usr/local/bin/backend-entrypoint
+
+USER 10001:10001
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+
+ENTRYPOINT ["backend-entrypoint"]
+CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
