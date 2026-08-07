@@ -325,11 +325,21 @@ pipeline {
                     repName: 'grype-backend-report.txt',
                     autoInstall: true
                 )
+                sh '''
+                    set -eu
+                    test -s grype-report.json
+                    cp grype-report.json reports/grype-backend-report.json
+                '''
                 grypeScan(
                     scanDest: "docker:${env.FRONTEND_IMAGE}",
                     repName: 'grype-frontend-report.txt',
                     autoInstall: true
                 )
+                sh '''
+                    set -eu
+                    test -s grype-report.json
+                    cp grype-report.json reports/grype-frontend-report.json
+                '''
             }
         }
 
@@ -338,7 +348,7 @@ pipeline {
                 script {
                     if (params.ENFORCE_GRYPE) {
                         recordIssues(
-                            tools: [grype(pattern: 'grype-*-report.json')],
+                            tools: [grype(pattern: 'reports/grype-*-report.json')],
                             aggregatingResults: true,
                             qualityGates: [
                                 [
@@ -355,7 +365,7 @@ pipeline {
                         )
                     } else {
                         recordIssues(
-                            tools: [grype(pattern: 'grype-*-report.json')],
+                            tools: [grype(pattern: 'reports/grype-*-report.json')],
                             aggregatingResults: true
                         )
                     }
